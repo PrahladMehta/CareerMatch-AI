@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import PdfParse from "pdf-parse";
+import {uploadChunksToPinecone} from "../services/createEmbeddings.service";
 
 const pdfToEmbed = async (req: Request, res: Response) => {
   try {
@@ -9,11 +10,9 @@ const pdfToEmbed = async (req: Request, res: Response) => {
 
     const pdfBuffer: Buffer = req.file.buffer;
 
-    // Convert Buffer → Uint8Array
-    const pdfData = new Uint8Array(pdfBuffer);
+    const data = await PdfParse(pdfBuffer); // It's a function now, not a class!
 
-    // Correct way to use pdf-parse v2+
-    const data = await PdfParse(pdfData); // It's a function now, not a class!
+    await uploadChunksToPinecone(data.text,"doc_123");
 
     return res.json({
       text: data.text,

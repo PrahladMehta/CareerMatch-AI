@@ -1,7 +1,7 @@
 
 import { Router } from "express";
 import multer from "multer";
-import { pdfToEmbed } from "../controller/CreateEmbadding";
+import { pdfToEmbed } from "../controller/CreateEmbedding";
 
 const router=Router();
 
