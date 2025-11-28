@@ -9,5 +9,8 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "allowSyntheticDefaultImports": true
-  }
+  },
+  "exclude": [
+    "prisma.config.ts"
+  ]
 }
