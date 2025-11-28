@@ -1,7 +1,9 @@
+// src/services/createEmbeddings.service.ts
+
 import { OpenAIEmbeddings } from "@langchain/openai";
+import { SentenceSplitter } from "llamaindex";
 import dotenv from "dotenv";
 import upsertVector from "./insertVector.service";
-
 dotenv.config();
 
 // Types
@@ -18,24 +20,28 @@ interface Metadata {
   createdAt: string;
 }
 
-// Custom text splitter
-function splitTextCustom(
-  text: string,
-  chunkSize = 1000,
-  chunkOverlap = 200
-): string[] {
-  const chunks: string[] = [];
-  for (let i = 0; i < text.length; i += chunkSize - chunkOverlap) {
-    chunks.push(text.slice(i, i + chunkSize));
-  }
-  return chunks;
-}
-
 // Initialize embeddings
 const embeddings = new OpenAIEmbeddings({
   openAIApiKey: process.env.OPENAI_API_KEY,
   modelName: "text-embedding-3-small",
 });
+
+/**
+ * Split text using LlamaIndex SentenceSplitter
+ * Maintains semantic coherence by splitting at sentence boundaries
+ */
+function splitTextWithLlamaIndex(
+  text: string,
+  chunkSize = 1024,
+  chunkOverlap = 20
+): string[] {
+  const splitter = new SentenceSplitter({
+    chunkSize,
+    chunkOverlap,
+  });
+
+  return splitter.splitText(text);
+}
 
 export async function createChunkedEmbeddings(
   text: string
@@ -45,21 +51,41 @@ export async function createChunkedEmbeddings(
       throw new Error("Text cannot be empty");
     }
 
-    // Use custom splitter
-    const chunks = splitTextCustom(text);
-    console.log(`Created ${chunks.length} chunks`);
+    // Use LlamaIndex SentenceSplitter
+    console.log("Using LlamaIndex SentenceSplitter...");
+    const chunks = splitTextWithLlamaIndex(text);
+
+    // Filter out empty or very small chunks
+    const filteredChunks = chunks.filter((c) => c.trim().length > 50);
+
+    console.log(`✓ Created ${filteredChunks.length} chunks`);
+    console.log(
+      `Chunk sizes: min=${Math.min(...filteredChunks.map((c) => c.length))}, max=${Math.max(...filteredChunks.map((c) => c.length))}`
+    );
 
     const chunksWithEmbeddings: ChunkEmbedding[] = [];
 
-    for (let i = 0; i < chunks.length; i++) {
-      const embedding = await embeddings.embedQuery(chunks[i]);
-      chunksWithEmbeddings.push({
-        chunk: chunks[i],
-        embedding,
-        index: i,
-      });
+    // Embed chunks with batch processing to avoid rate limits
+    for (let i = 0; i < filteredChunks.length; i++) {
+      try {
+        const embedding = await embeddings.embedQuery(filteredChunks[i]);
+        chunksWithEmbeddings.push({
+          chunk: filteredChunks[i],
+          embedding,
+          index: i,
+        });
+
+        // Log progress every 5 chunks
+        if ((i + 1) % 5 === 0) {
+          console.log(`  Embedded ${i + 1}/${filteredChunks.length} chunks...`);
+        }
+      } catch (err: any) {
+        console.error(`Failed to embed chunk ${i}:`, err.message);
+        // Continue with next chunk instead of failing completely
+      }
     }
 
+    console.log(`✓ Successfully embedded ${chunksWithEmbeddings.length} chunks`);
     return chunksWithEmbeddings;
   } catch (error: any) {
     console.error("Embedding error:", error);
@@ -72,11 +98,16 @@ export async function uploadChunksToPinecone(
   documentId: string
 ): Promise<void> {
   try {
-    console.log("Starting chunk creation and upload...");
+    console.log(`Starting chunk creation and upload for document: ${documentId}`);
 
     const chunksWithEmbeddings = await createChunkedEmbeddings(text);
+
+    if (chunksWithEmbeddings.length === 0) {
+      throw new Error("No chunks were created from the document");
+    }
+
     console.log(
-      `Successfully created ${chunksWithEmbeddings.length} embeddings`
+      `Uploading ${chunksWithEmbeddings.length} chunks to Pinecone...`
     );
 
     for (const item of chunksWithEmbeddings) {
@@ -89,14 +120,22 @@ export async function uploadChunksToPinecone(
         createdAt: new Date().toISOString(),
       };
 
-      await upsertVector(id, item.embedding, metadata);
-      console.log(`Uploaded chunk ${item.index} (ID: ${id})`);
+      try {
+        await upsertVector(id, item.embedding, metadata);
+        // Log every 10 uploads
+        if ((item.index + 1) % 10 === 0) {
+          console.log(`  Uploaded ${item.index + 1} chunks to Pinecone...`);
+        }
+      } catch (err: any) {
+        console.error(`Failed to upload chunk ${item.index}:`, err.message);
+      }
     }
 
-    console.log("All chunks uploaded to Pinecone successfully!");
+    console.log(
+      `✓ All ${chunksWithEmbeddings.length} chunks uploaded to Pinecone successfully!`
+    );
   } catch (error: any) {
     console.error("Error uploading chunks to Pinecone:", error);
     throw new Error(`Failed to upload chunks: ${error.message}`);
   }
 }
-    
