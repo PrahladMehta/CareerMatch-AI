@@ -1,18 +1,23 @@
 // src/services/insertVector.service.ts
 
+import { use } from "../routes/CreateEmbedding";
 import { pinecone } from "../utils/pinecone";
+import initPinecone from "./initPinecone.service";
+import {v4 as uuid} from "uuid"
 
 interface UpsertMetadata {
   chunkIndex: number;
   chunkContent: string;
   documentId: string;
   createdAt: string;
+  userId: string;
+  resumeId: string;
 }
 
 const INDEX_NAME = "rag-index";
 
 async function upsertVector(
-  id: string,
+  id:string,
   values: number[],
   metadata: UpsertMetadata
 ) {
@@ -30,7 +35,7 @@ async function upsertVector(
 
     // ✅ DON'T call initPinecone() here - it calls deleteAll()
     // ✅ Just get the index directly
-    const index = pinecone.Index(INDEX_NAME);
+    const index = await initPinecone();
 
     // Log what we're about to insert
     console.log(
@@ -43,6 +48,8 @@ async function upsertVector(
       chunkContent: metadata.chunkContent,
       documentId: metadata.documentId || "unknown",
       createdAt: metadata.createdAt || new Date().toISOString(),
+      userId: metadata.userId,
+      resumeId: metadata.resumeId
     };
 
     // Upsert to Pinecone

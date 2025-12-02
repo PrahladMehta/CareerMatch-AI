@@ -14,9 +14,120 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// =====================
+// User
+// =====================
 model User {
-  id    Int     @id @default(autoincrement())
-  name  String
-  email String  @unique
-  age   Int?
+  id        String         @id @default(uuid())
+  name      String         @unique
+  // email     String?       @unique
+  password  String
+  createdAt DateTime       @default(now())
+
+  resumes        Resume[]
+  conversations  Conversation[]
+  memories       Memory[]
 }
+
+// =====================
+// Resume (per uploaded PDF)
+// =====================
+model Resume {
+  id         String       @id @default(uuid())
+  userId     String
+  user       User         @relation(fields: [userId], references: [id])
+
+  rawText    String?      
+  summary    String?
+  skills     String[]
+  experience Json?
+  createdAt  DateTime     @default(now())
+
+  // Metadata-only vector storage uses metadata fields instead of Pinecone namespaces
+  chunks     ResumeChunk[]
+  conversations Conversation[]
+}
+
+// =====================
+// ResumeChunk -> stored as vectors in Pinecone (metadata-based)
+// Also stored in DB for traceability + debugging
+// =====================
+model ResumeChunk {
+  id         String     @id @default(uuid())
+  resumeId   String
+  resume     Resume     @relation(fields: [resumeId], references: [id])
+
+  userId     String     // redundant but useful for filtering & debugging
+
+  chunkIndex Int
+  section    String?    // skills, experience, education, etc.
+  text       String
+  pineconeId String     // vector ID stored in Pinecone index
+  source     String     @default("resume") // resume / global / web / job
+  createdAt  DateTime   @default(now())
+}
+
+// =====================
+// Conversations
+// =====================
+model Conversation {
+  id        String     @id @default(uuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id])
+
+  resumeId  String?
+  resume    Resume?    @relation(fields: [resumeId], references: [id])
+
+  title     String?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  messages   Message[]
+}
+
+// =====================
+// Messages
+// =====================
+model Message {
+  id              String          @id @default(uuid())
+  conversationId  String
+  conversation    Conversation    @relation(fields: [conversationId], references: [id])
+
+  role            String          // user | assistant | system
+  text            String
+  source          String?         // resume | web | job | global | llm
+  citedChunks     Json?           // array of metadata from Pinecone matches
+
+  createdAt       DateTime        @default(now())
+}
+
+// =====================
+// Memories (persistent preferences)
+// =====================
+model Memory {
+  id         String     @id @default(uuid())
+  userId     String
+  user       User       @relation(fields: [userId], references: [id])
+
+  key        String
+  value      Json
+  confidence Float       @default(1.0)
+  createdAt  DateTime    @default(now())
+}
+
+// =====================
+// Global Vectors (Optional)
+// Useful for job data / web results
+// =====================
+model GlobalVector {
+  id         String     @id @default(uuid())
+  userId     String?    // optional, can be null for system-wide data
+
+  text       String
+  pineconeId String
+  source     String      @default("global") // global | job | web
+  metadata   Json?
+
+  createdAt  DateTime    @default(now())
+}
+

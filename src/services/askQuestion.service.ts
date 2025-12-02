@@ -3,10 +3,12 @@
 import { queryRAG } from "./queryPincone.service.js";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
+import axios from "axios";
+import prisma from "../utils/prisma.js";
 
-// Fixed settings — you control everything
+// Fixed settings
 const TOP_K = 10;
-const MIN_SCORE = 0.5; // Lowered from 0.78 to capture more results
+const MIN_SCORE = 0.5;
 const MODEL = "gpt-4o-mini";
 
 const llm = new ChatOpenAI({
@@ -15,12 +17,11 @@ const llm = new ChatOpenAI({
   temperature: 0.1,
 });
 
-// Updated prompt - clearer instruction to use context
-const PROMPT = ChatPromptTemplate.fromMessages([
+// Prompt for RAG context
+const RAG_PROMPT = ChatPromptTemplate.fromMessages([
   [
     "system",
-    `You are a helpful assistant. Your job is to answer questions based on the provided context.
-    
+    `You are a helpful assistant. Answer the question using ONLY the provided context.
 Rules:
 1. Use ONLY information from the context provided
 2. If the context contains relevant information, answer the question
@@ -38,15 +39,92 @@ Answer:`,
   ],
 ]);
 
-// Build the chain
-const chain = PROMPT.pipe(llm);
+// Prompt for web search results
+const WEB_PROMPT = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    `You are a helpful assistant. Answer the question using the provided web search results.
+Rules:
+1. Use the search results to answer the question
+2. Provide accurate, helpful information
+3. If results don't contain the answer, say so
+4. Be concise and direct`,
+  ],
+  [
+    "human",
+    `Search Results:
+{context}
+
+Question: {question}
+
+Answer:`,
+  ],
+]);
+
+const ragChain = RAG_PROMPT.pipe(llm);
+const webChain = WEB_PROMPT.pipe(llm);
 
 /**
- * Ask a question to your RAG system
+ * Search using Serper API
+ */
+async function searchWithSerper(query: string): Promise<string> {
+  try {
+    if (!process.env.SERPER_API_KEY) {
+      console.log("⚠ SERPER_API_KEY not set, skipping web search");
+      return "";
+    }
+
+    console.log("🌐 Searching the web with Serper...");
+
+    const response = await axios.post("https://google.serper.dev/search", {
+      q: query,
+      num: 5,
+    }, {
+      headers: {
+        "X-API-KEY": process.env.SERPER_API_KEY,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.data.organic || response.data.organic.length === 0) {
+      console.log("⚠ No web search results found");
+      return "";
+    }
+
+    // Format search results
+    const formattedResults = response.data.organic
+      .slice(0, 5)
+      .map((result: any, i: number) => 
+        `[${i + 1}] ${result.title}\n${result.snippet}`
+      )
+      .join("\n\n");
+
+    console.log(`✓ Got ${response.data.organic.length} search results`);
+    return formattedResults;
+  } catch (error: any) {
+    console.error("❌ Serper search failed:", error.message);
+    return "";
+  }
+}
+
+/**
+ * Check if context is relevant (simple heuristic)
+ */
+function isContextRelevant(chunks: any[]): boolean {
+  if (chunks.length === 0) return false;
+  
+  // If we have at least 2 chunks with decent scores, consider it relevant
+  const relevantChunks = chunks.filter((c) => c.score >= MIN_SCORE);
+  return relevantChunks.length >= 2;
+}
+
+/**
+ * Ask a question to your RAG system with Serper fallback
  */
 export async function askQuestion(
   question: string,
-  documentId?: string
+  documentId?: string,
+  conversationId?:string
 ): Promise<string> {
   if (!question?.trim()) {
     return "Please provide a valid question.";
@@ -55,72 +133,72 @@ export async function askQuestion(
   try {
     console.log("\n🔍 Question:", question);
 
-    // 1. Retrieve relevant chunks from Pinecone
-    console.log("📡 Querying Pinecone...");
+    // 1. Try RAG first
+    console.log("📡 Querying RAG system...");
     const results = await queryRAG(question, {
-      topK: TOP_K * 2, // Get 20 results
+      topK: TOP_K * 2,
       namespace: documentId || "",
     });
 
-    console.log(`✓ Retrieved ${results.length} results from Pinecone`);
+    console.log(`✓ Retrieved ${results.length} results from RAG`);
 
-    // 2. Log ALL results with scores for debugging
-    if (results.length > 0) {
-      console.log("\n📊 All retrieval scores:");
-      results.slice(0, 5).forEach((r, i) => {
-        console.log(
-          `  [${i + 1}] Score: ${r.score?.toFixed(3)} | Content: ${r.content?.substring(0, 60)}...`
-        );
-      });
-    }
+    // 2. Check if RAG results are relevant
+    const ragRelevant = isContextRelevant(results);
+    console.log(
+      `📊 RAG Relevance: ${ragRelevant ? "✓ Good" : "✗ Poor"}`
+    );
 
-    // 3. Filter and select chunks - ACTUALLY ASSIGN THEM
-    const goodChunks = results
-      .filter((r) => r.score >= MIN_SCORE)
-      .slice(0, TOP_K);
+    if (ragRelevant) {
+      // Use RAG context
+      console.log("✓ Using RAG context");
 
-    console.log(`\n✓ Filtered to ${goodChunks.length} chunks (MIN_SCORE=${MIN_SCORE})`);
+      const goodChunks = results
+        .filter((r) => r.score >= MIN_SCORE)
+        .slice(0, TOP_K);
 
-    if (goodChunks.length === 0) {
-      console.log("⚠ No chunks passed filtering");
-      
-      // Fallback: use top 5 anyway if all were filtered out
-      const fallbackChunks = results.slice(0, 5);
-      if (fallbackChunks.length > 0) {
-        console.log("📌 Using top 5 chunks as fallback (scores were low)");
-        const context = fallbackChunks
-          .map((c, i) => `[${i + 1}] ${c.content.trim()}`)
-          .join("\n\n");
+      const context = goodChunks
+        .map((c, i) => `[${i + 1}] ${c.content.trim()}`)
+        .join("\n\n");
 
-        console.log(`📝 Context length: ${context.length} chars`);
-        const response = await chain.invoke({ question, context });
-        console.log("RESPONSE",response);
-        return extractAnswer(response);
+      console.log(`📝 RAG context length: ${context.length} chars\n`);
+
+      const response = await ragChain.invoke({ question, context });
+      const answer = extractAnswer(response);
+
+      if (
+        answer &&
+        !answer.includes("don't have enough information") &&
+        answer.length > 10
+      ) {
+        console.log(`✓ RAG answer: ${answer.substring(0, 100)}...\n`);
+        return answer;
       }
-
-      return "I don't have enough relevant information to answer your question.";
     }
 
-    // 4. Build context string
-    const context = goodChunks
-      .map((c, i) => `[${i + 1}] ${c.content.trim()}`)
-      .join("\n\n");
+    // 3. RAG didn't work well, try Serper
+    console.log("⚠ RAG context not sufficient, falling back to Serper API...\n");
 
-    console.log(`📝 Context length: ${context.length} chars`);
-    console.log(`Context preview:\n${context.substring(0, 200)}...\n`);
+    const webContext = await searchWithSerper(question);
 
-    // 5. Run the chain and extract answer
-    console.log("🤖 Sending to LLM...");
-    const response = await chain.invoke({ question, context });
+    if (!webContext) {
+      return "I don't have enough information to answer this question. Please try a different question or provide more context.";
+    }
 
-    console.log("✓ LLM response received");
+    // Use web search results
+    console.log("🤖 Generating answer from web search...");
+    const response = await webChain.invoke({
+      question,
+      context: webContext,
+    });
+
     const answer = extractAnswer(response);
-    console.log(`Answer: ${answer.substring(0, 100)}...\n`);
+    console.log(`✓ Web answer: ${answer.substring(0, 100)}...\n`);
+    
+
 
     return answer;
-
   } catch (error: any) {
-    console.error("❌ RAG ask failed:", error.message);
+    console.error("❌ Question answering failed:", error.message);
     return "Sorry, something went wrong. Please try again later.";
   }
 }

@@ -2,6 +2,7 @@
 
 import { Request, Response } from "express";
 import { askQuestion } from "../services/askQuestion.service";
+import prisma from "../utils/prisma";
 
 /**
  * POST /api/ask
@@ -9,7 +10,21 @@ import { askQuestion } from "../services/askQuestion.service";
  */
 export async function askController(req: Request, res: Response): Promise<void> {
   try {
-    const { question, documentId } = req.body;
+    const { question, documentId,conversationId } = req.body;
+    const userId = (req as Request & { userId?: string }).userId;
+
+    if (!userId) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
 
     // Validation
     if (!question || typeof question !== "string" || question.trim().length === 0) {
@@ -31,7 +46,7 @@ export async function askController(req: Request, res: Response): Promise<void> 
     console.log(`[ASK] Question: "${cleanQuestion}"${documentId ? ` | Doc: ${documentId}` : ""}`);
 
     // Call your RAG pipeline (all settings are fixed & safe inside askQuestion)
-    const answer = await askQuestion(cleanQuestion, documentId?.trim() || undefined);
+    const answer = await askQuestion(cleanQuestion, documentId?.trim() || undefined,conversationId);
 
     // Success response
     res.json({
