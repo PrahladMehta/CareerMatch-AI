@@ -10,8 +10,9 @@ import prisma from "../utils/prisma";
  */
 export async function askController(req: Request, res: Response): Promise<void> {
   try {
-    const { question, documentId,conversationId } = req.body;
+    const { question, documentId,conversationId,resumeId} = req.body;
     const userId = (req as Request & { userId?: string }).userId;
+    console.log("askController invoked",);
 
     if (!userId) {
       res.status(401).json({ error: "Unauthorized" });
@@ -46,7 +47,7 @@ export async function askController(req: Request, res: Response): Promise<void> 
     console.log(`[ASK] Question: "${cleanQuestion}"${documentId ? ` | Doc: ${documentId}` : ""}`);
 
     // Call your RAG pipeline (all settings are fixed & safe inside askQuestion)
-    const answer = await askQuestion(cleanQuestion, documentId?.trim() || undefined,conversationId);
+    const answer = await askQuestion(cleanQuestion, userId,conversationId,resumeId);
 
     // Success response
     res.json({

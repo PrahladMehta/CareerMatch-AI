@@ -68,30 +68,17 @@ model ResumeChunk {
 }
 
 // =====================
-// Conversations
-// =====================
-model Conversation {
-  id        String     @id @default(uuid())
-  userId    String
-  user      User       @relation(fields: [userId], references: [id])
-
-  resumeId  String?
-  resume    Resume?    @relation(fields: [resumeId], references: [id])
-
-  title     String?
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
-
-  messages   Message[]
-}
-
-// =====================
-// Messages
+// Messages with Threading
 // =====================
 model Message {
   id              String          @id @default(uuid())
   conversationId  String
-  conversation    Conversation    @relation(fields: [conversationId], references: [id])
+  conversation    Conversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  // Thread/Reply tracking
+  replyToId       String?         // ID of the message this replies to (for threading)
+  replyTo         Message?        @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies         Message[]       @relation("MessageReplies") // Messages that reply to this one
 
   role            String          // user | assistant | system
   text            String
@@ -99,6 +86,31 @@ model Message {
   citedChunks     Json?           // array of metadata from Pinecone matches
 
   createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @default(now())
+
+  @@index([conversationId])
+  @@index([replyToId])
+}
+
+// =====================
+// Conversations
+// =====================
+model Conversation {
+  id        String     @id @default(uuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  resumeId  String?
+  resume    Resume?    @relation(fields: [resumeId], references: [id], onDelete: SetNull)
+
+  title     String?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  messages   Message[]
+
+  @@index([userId])
+  @@index([resumeId])
 }
 
 // =====================
