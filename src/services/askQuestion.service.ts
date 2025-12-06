@@ -2,13 +2,16 @@
 
 import { queryRAG } from "./queryPincone.service.js";
 import { ChatOpenAI } from "@langchain/openai";
-import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import axios from "axios";
 import prisma from "../utils/prisma.js";
+import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
 
 const TOP_K = 10;
 const MIN_SCORE = 0.1;
 const MODEL = "gpt-4o-mini";
+const MAX_HISTORY_MESSAGES = 6; // Last 3 Q&A pairs
+const MAX_TOKENS_HISTORY = 2000;
 
 const llm = new ChatOpenAI({
   openAIApiKey: process.env.OPENAI_API_KEY!,
@@ -19,15 +22,16 @@ const llm = new ChatOpenAI({
 const COMBINED_PROMPT = ChatPromptTemplate.fromMessages([
   [
     "system",
-    `You are a helpful assistant. Answer the question using BOTH your resume context and web search results.
+    `You are a helpful assistant. Answer questions using resume context and web search results.
+Consider conversation history for context and avoid repetition.
 Rules:
-1. If resume context is available and relevant, use it as primary source
-2. Use web search results as supplementary information
-3. Clearly indicate the source (e.g., "Based on your resume..." or "From web search...")
-4. If BOTH sources lack relevant information, say: "I don't have enough information to answer this."
-5. Be concise and accurate
-6. If information conflicts between sources, note both perspectives`,
+1. Use resume as primary source, web search as supplementary
+2. Clearly indicate source (e.g., "Based on your resume..." or "From web search...")
+3. Reference previous answers if relevant
+4. If BOTH sources lack info, say: "I don't have enough information"
+5. Be concise and accurate`,
   ],
+  new MessagesPlaceholder("history"),
   [
     "human",
     `Resume Context:
@@ -45,12 +49,14 @@ Answer:`,
 const RAG_ONLY_PROMPT = ChatPromptTemplate.fromMessages([
   [
     "system",
-    `You are a helpful assistant. Answer using ONLY the resume context provided.
+    `You are a helpful assistant. Answer using resume context.
+Consider conversation history for context.
 Rules:
-1. Use ONLY information from the context
-2. Be concise and direct
-3. Only say "I don't have enough information" if context doesn't address the question`,
+1. Use ONLY resume information
+2. Reference previous points if relevant
+3. Be concise and avoid repetition`,
   ],
+  new MessagesPlaceholder("history"),
   [
     "human",
     `Resume Context:
@@ -67,7 +73,7 @@ const WEB_ONLY_PROMPT = ChatPromptTemplate.fromMessages([
     "system",
     `You are a job-search assistant. Extract job openings from search results.
 Rules:
-1. Only return jobs where the user can apply
+1. Only return jobs where user can apply
 2. Include job title, company name, and application link
 3. If no jobs found, say: "No job openings found."
 4. Do NOT include irrelevant information (articles, blogs, courses)
@@ -104,6 +110,72 @@ interface QuestionResponse {
   answer: string;
   citedChunks: CitedChunk[];
   source: "rag" | "web" | "combined" | "error";
+}
+
+/**
+ * Fetch recent conversation history
+ */
+async function getConversationHistory(
+  conversationId: string,
+  limit: number = MAX_HISTORY_MESSAGES
+): Promise<BaseMessage[]> {
+  try {
+    const messages = await prisma.message.findMany({
+      where: { conversationId },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    });
+
+    if (messages.length === 0) return [];
+
+    // Reverse to get chronological order
+    const reversedMessages = messages.reverse();
+
+    // Convert to LangChain messages
+    return reversedMessages.map((msg) => {
+      if (msg.role === "user") {
+        return new HumanMessage(msg.text);
+      } else if (msg.role === "assistant") {
+        return new AIMessage(msg.text);
+      } else {
+        return new HumanMessage(msg.text);
+      }
+    });
+  } catch (error: any) {
+    console.error("Failed to fetch conversation history:", error.message);
+    return [];
+  }
+}
+
+/**
+ * Estimate token count
+ */
+function estimateTokenCount(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Filter history by token limit
+ */
+function filterHistoryByTokens(
+  messages: BaseMessage[],
+  maxTokens: number = MAX_TOKENS_HISTORY
+): BaseMessage[] {
+  let totalTokens = 0;
+  const result: BaseMessage[] = [];
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msgTokens = estimateTokenCount(messages[i].content as string);
+    
+    if (totalTokens + msgTokens > maxTokens) {
+      break;
+    }
+
+    result.unshift(messages[i]);
+    totalTokens += msgTokens;
+  }
+
+  return result;
 }
 
 /**
@@ -222,7 +294,7 @@ async function saveMessage(
 }
 
 /**
- * Ask a question using combined RAG + Web search
+ * Ask a question with conversation history
  */
 export async function askQuestion(
   question: string,
@@ -248,13 +320,11 @@ export async function askQuestion(
     );
 
     // Save user message
-    await saveMessage(
-      finalConversationId,
-      "user",
-      question,
-      "user",
-      []
-    );
+    await saveMessage(finalConversationId, "user", question, "user", []);
+
+    // Fetch conversation history
+    let history = await getConversationHistory(finalConversationId);
+    history = filterHistoryByTokens(history);
 
     // Query both RAG and Web simultaneously
     const [ragResults, webChunks] = await Promise.all([
@@ -268,14 +338,10 @@ export async function askQuestion(
       searchWithSerper(question),
     ]);
 
-    console.log(`RAG results: ${ragResults.length}, Web results: ${webChunks.length}`);
-
     const ragRelevant = isContextRelevant(ragResults);
     const webRelevant = webChunks.length > 0;
 
-    console.log(`RAG relevant: ${ragRelevant}, Web relevant: ${webRelevant}`);
-
-    // Case 1: Both RAG and Web have relevant context - combine them
+    // Case 1: Both RAG and Web have relevant context
     if (ragRelevant && webRelevant) {
       const goodRagChunks = ragResults
         .filter((r) => r.score >= MIN_SCORE)
@@ -290,6 +356,7 @@ export async function askQuestion(
         .join("\n\n");
 
       const response = await combinedChain.invoke({
+        history,
         question,
         ragContext,
         webContext,
@@ -340,7 +407,12 @@ export async function askQuestion(
         .map((c, i) => `[${i + 1}] ${c.content.trim()}`)
         .join("\n\n");
 
-      const response = await ragOnlyChain.invoke({ question, context });
+      const response = await ragOnlyChain.invoke({
+        history,
+        question,
+        context,
+      });
+
       const answer = extractAnswer(response);
 
       if (answer && answer.length > 10 && !answer.includes("don't have enough")) {
