@@ -2,7 +2,10 @@
 
 import { queryRAG } from "./queryPincone.service.js";
 import { ChatOpenAI } from "@langchain/openai";
-import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
+import {
+  ChatPromptTemplate,
+  MessagesPlaceholder,
+} from "@langchain/core/prompts";
 import axios from "axios";
 import prisma from "../utils/prisma.js";
 import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
@@ -10,14 +13,22 @@ import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
 const TOP_K = 10;
 const MIN_SCORE = 0.1;
 const MODEL = "gpt-4o-mini";
-const MAX_HISTORY_MESSAGES = 6; // Last 3 Q&A pairs
-const MAX_TOKENS_HISTORY = 2000;
+const MAX_HISTORY_MESSAGES = 4;
+const MAX_TOKENS_HISTORY = 1000;
 
 const llm = new ChatOpenAI({
   openAIApiKey: process.env.OPENAI_API_KEY!,
   model: MODEL,
   temperature: 0.1,
 });
+
+// import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+
+// const llm = new ChatGoogleGenerativeAI({
+//   model: "gemini-2.0-flash",  // or "gemini-2.5-pro-exp", "gemini-1.5-pro"
+//   temperature: 0.1,
+//   googleApikey: process.env.GOOGLE_API_KEY!,  // optional if set in env
+// });
 
 const COMBINED_PROMPT = ChatPromptTemplate.fromMessages([
   [
@@ -68,25 +79,30 @@ Answer:`,
   ],
 ]);
 
-const WEB_ONLY_PROMPT = ChatPromptTemplate.fromMessages([
+const JOB_SEARCH_PROMPT = ChatPromptTemplate.fromMessages([
   [
     "system",
-    `You are a job-search assistant. Extract job openings from search results.
+    `You are a job search assistant. Format and present job opportunities clearly.
 Rules:
-1. Only return jobs where user can apply
-2. Include job title, company name, and application link
-3. If no jobs found, say: "No job openings found."
-4. Do NOT include irrelevant information (articles, blogs, courses)
-5. List only real job opportunities`,
+1. Extract job title, company name, location, salary (if available), and apply link
+2. Match jobs to user skills from resume if available
+3. Only include jobs user can apply for
+4. If no relevant jobs found, say: "No matching job opportunities found."
+5. Be concise and well-organized
+6. Always include apply links for each job`,
   ],
+  new MessagesPlaceholder("history"),
   [
     "human",
-    `Search Results:
-{context}
+    `Job Search Results:
+{jobResults}
+
+Resume Context (Skills):
+{resumeContext}
 
 User Query: {question}
 
-Provide a clean list of job openings with apply links only.
+Format jobs as a clean, organized list with apply links and company details.
 
 Answer:`,
   ],
@@ -94,7 +110,7 @@ Answer:`,
 
 const combinedChain = COMBINED_PROMPT.pipe(llm);
 const ragOnlyChain = RAG_ONLY_PROMPT.pipe(llm);
-const webOnlyChain = WEB_ONLY_PROMPT.pipe(llm);
+const jobSearchChain = JOB_SEARCH_PROMPT.pipe(llm);
 
 interface CitedChunk {
   id: string;
@@ -102,84 +118,154 @@ interface CitedChunk {
   content: string;
   documentId: string;
   chunkIndex: number;
-  source: "rag" | "web";
+  source: "rag" | "web" | "job";
+}
+
+interface JobApplyOption {
+  publisher: string;
+  apply_link: string;
+  is_direct: boolean;
+}
+
+interface JobData {
+  job_id: string;
+  job_title: string;
+  job_description: string;
+  employer_name: string;
+  employer_logo?: string;
+  employer_website?: string;
+  job_country?: string;
+  job_state?: string;
+  job_city?: string;
+  job_salary?: string;
+  job_min_salary?: number;
+  job_max_salary?: number;
+  job_apply_link: string;
+  job_apply_is_direct: boolean;
+  apply_options?: JobApplyOption[];
+  job_employment_type: string;
+  job_is_remote: boolean;
+  job_posted_at: string;
+  job_location: string;
+  job_publisher?: string;
 }
 
 interface QuestionResponse {
   conversationId: string;
   answer: string;
   citedChunks: CitedChunk[];
-  source: "rag" | "web" | "combined" | "error";
+  source: "rag" | "web" | "job" | "combined" | "error";
 }
 
 /**
- * Fetch recent conversation history
+ * Detect if query is job-related
  */
-async function getConversationHistory(
-  conversationId: string,
-  limit: number = MAX_HISTORY_MESSAGES
-): Promise<BaseMessage[]> {
+function isJobSearchQuery(question: string): boolean {
+  const jobKeywords = [
+    "job",
+    "position",
+    "role",
+    "hiring",
+    "opportunity",
+    "career",
+    "work",
+    "employment",
+    "apply",
+    "looking for",
+    "recruit",
+    "vacancy",
+    "opening",
+  ];
+  const lowerQuestion = question.toLowerCase();
+  return jobKeywords.some((keyword) => lowerQuestion.includes(keyword));
+}
+
+/**
+ * Search using JSearch API
+ */
+async function searchWithJSearch(query: string): Promise<CitedChunk[]> {
   try {
-    const messages = await prisma.message.findMany({
-      where: { conversationId },
-      orderBy: { createdAt: "desc" },
-      take: limit,
+    if (!process.env.JSEARCH_API_KEY) {
+      console.warn("JSearch API key not configured");
+      return [];
+    }
+
+    const requestUrl = new URL("https://jsearch.p.rapidapi.com/search");
+    requestUrl.searchParams.append("query", query);
+    requestUrl.searchParams.append("page", "1");
+    requestUrl.searchParams.append("num_pages", "1");
+    requestUrl.searchParams.append("country", "ind");
+    requestUrl.searchParams.append("date_posted", "month");
+    requestUrl.searchParams.append("language", "en");
+
+    const response = await axios.get(requestUrl.toString(), {
+      headers: {
+        "x-rapidapi-host": "jsearch.p.rapidapi.com",
+        "x-rapidapi-key": process.env.JSEARCH_API_KEY,
+      },
     });
 
-    if (messages.length === 0) return [];
+    if (
+      response.data.status !== "OK" ||
+      !response.data.data ||
+      response.data.data.length === 0
+    ) {
+      return [];
+    }
 
-    // Reverse to get chronological order
-    const reversedMessages = messages.reverse();
+    const jobChunks: CitedChunk[] = response.data.data
+      .slice(0, 10)
+      .map((job: JobData, i: number) => {
+        const salary = job.job_salary
+          ? job.job_salary
+          : job.job_min_salary
+          ? `₹${job.job_min_salary.toLocaleString()}${
+              job.job_max_salary
+                ? `-₹${job.job_max_salary.toLocaleString()}`
+                : ""
+            }`
+          : "Not specified";
 
-    // Convert to LangChain messages
-    return reversedMessages.map((msg) => {
-      if (msg.role === "user") {
-        return new HumanMessage(msg.text);
-      } else if (msg.role === "assistant") {
-        return new AIMessage(msg.text);
-      } else {
-        return new HumanMessage(msg.text);
-      }
-    });
+        const location = job.job_location || "Remote";
+
+        // Get best apply link (prefer direct apply)
+        const bestApplyOption =
+          job.apply_options?.find((opt) => opt.is_direct) ||
+          job.apply_options?.[0];
+        const applyLink = bestApplyOption?.apply_link || job.job_apply_link;
+
+        const content = `
+Job Title: ${job.job_title}
+Company: ${job.employer_name}
+Location: ${location}
+Employment Type: ${job.job_employment_type}
+Remote: ${job.job_is_remote ? "Yes" : "No"}
+Salary: ${salary}
+Posted: ${job.job_posted_at}
+Publisher: ${job.job_publisher || "Job Board"}
+Description: ${job.job_description.substring(0, 400)}...
+Apply Link: ${applyLink}
+Direct Apply: ${job.job_apply_is_direct ? "Yes" : "No"}`;
+
+        return {
+          id: job.job_id,
+          score: 1 - i * 0.05,
+          content: content.trim(),
+          documentId: `job_${job.job_id}`,
+          chunkIndex: i,
+          source: "job" as const,
+        };
+      });
+
+    return jobChunks;
   } catch (error: any) {
-    console.error("Failed to fetch conversation history:", error.message);
+    console.error("JSearch API error:", error.message);
     return [];
   }
 }
 
 /**
- * Estimate token count
- */
-function estimateTokenCount(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
-/**
- * Filter history by token limit
- */
-function filterHistoryByTokens(
-  messages: BaseMessage[],
-  maxTokens: number = MAX_TOKENS_HISTORY
-): BaseMessage[] {
-  let totalTokens = 0;
-  const result: BaseMessage[] = [];
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msgTokens = estimateTokenCount(messages[i].content as string);
-    
-    if (totalTokens + msgTokens > maxTokens) {
-      break;
-    }
-
-    result.unshift(messages[i]);
-    totalTokens += msgTokens;
-  }
-
-  return result;
-}
-
-/**
- * Search using Serper API
+ * Search using Serper API for general queries
  */
 async function searchWithSerper(query: string): Promise<CitedChunk[]> {
   try {
@@ -187,15 +273,19 @@ async function searchWithSerper(query: string): Promise<CitedChunk[]> {
       return [];
     }
 
-    const response = await axios.post("https://google.serper.dev/search", {
-      q: query,
-      num: 10,
-    }, {
-      headers: {
-        "X-API-KEY": process.env.SERPER_API_KEY,
-        "Content-Type": "application/json",
+    const response = await axios.post(
+      "https://google.serper.dev/search",
+      {
+        q: query,
+        num: 10,
       },
-    });
+      {
+        headers: {
+          "X-API-KEY": process.env.SERPER_API_KEY,
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
     if (!response.data.organic || response.data.organic.length === 0) {
       return [];
@@ -265,16 +355,17 @@ async function saveMessage(
   citedChunks: CitedChunk[]
 ): Promise<string> {
   try {
-    const citedChunksData = citedChunks.length > 0 
-      ? citedChunks.map((chunk) => ({
-          id: chunk.id,
-          score: chunk.score,
-          content: chunk.content,
-          documentId: chunk.documentId,
-          chunkIndex: chunk.chunkIndex,
-          source: chunk.source,
-        }))
-      : null;
+    const citedChunksData =
+      citedChunks.length > 0
+        ? citedChunks.map((chunk) => ({
+            id: chunk.id,
+            score: chunk.score,
+            content: chunk.content,
+            documentId: chunk.documentId,
+            chunkIndex: chunk.chunkIndex,
+            source: chunk.source,
+          }))
+        : null;
 
     const message = await prisma.message.create({
       data: {
@@ -291,6 +382,70 @@ async function saveMessage(
     console.error("Failed to save message:", error.message);
     throw error;
   }
+}
+
+/**
+ * Fetch recent conversation history
+ */
+async function getConversationHistory(
+  conversationId: string,
+  limit: number = MAX_HISTORY_MESSAGES
+): Promise<BaseMessage[]> {
+  try {
+    const messages = await prisma.message.findMany({
+      where: { conversationId },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    });
+
+    if (messages.length === 0) return [];
+
+    const reversedMessages = messages.reverse();
+
+    return reversedMessages.map((msg) => {
+      if (msg.role === "user") {
+        return new HumanMessage(msg.text);
+      } else if (msg.role === "assistant") {
+        return new AIMessage(msg.text);
+      } else {
+        return new HumanMessage(msg.text);
+      }
+    });
+  } catch (error: any) {
+    console.error("Failed to fetch conversation history:", error.message);
+    return [];
+  }
+}
+
+/**
+ * Estimate token count
+ */
+function estimateTokenCount(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Filter history by token limit
+ */
+function filterHistoryByTokens(
+  messages: BaseMessage[],
+  maxTokens: number = MAX_TOKENS_HISTORY
+): BaseMessage[] {
+  let totalTokens = 0;
+  const result: BaseMessage[] = [];
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msgTokens = estimateTokenCount(messages[i].content as string);
+
+    if (totalTokens + msgTokens > maxTokens) {
+      break;
+    }
+
+    result.unshift(messages[i]);
+    totalTokens += msgTokens;
+  }
+
+  return result;
 }
 
 /**
@@ -312,31 +467,80 @@ export async function askQuestion(
   }
 
   try {
-    // Get or create conversation
     const finalConversationId = await getOrCreateConversation(
       userId,
       conversationId,
       resumeId
     );
 
-    // Save user message
     await saveMessage(finalConversationId, "user", question, "user", []);
 
-    // Fetch conversation history
     let history = await getConversationHistory(finalConversationId);
     history = filterHistoryByTokens(history);
 
-    // Query both RAG and Web simultaneously
-    const [ragResults, webChunks] = await Promise.all([
-      queryRAG(question, {
-        topK: TOP_K * 2,
-        filter: {
-          userId,
-          resumeId,
-        },
-      }),
-      searchWithSerper(question),
-    ]);
+    // Detect if job search query
+    const isJobQuery = isJobSearchQuery(question);
+
+    if (isJobQuery) {
+      // Search jobs using JSearch API
+      const jobChunks = await searchWithJSearch(question);
+
+      if (jobChunks.length > 0) {
+        // Also get RAG context for resume skills matching
+        const ragResults = await queryRAG(question, {
+          topK: 5,
+          filter: {
+            userId,
+            resumeId,
+          },
+        });
+
+        const resumeContext = ragResults
+          .filter((r) => r.score >= MIN_SCORE)
+          .map((c) => c.content)
+          .join("\n");
+
+        const jobResults = jobChunks
+          .map((c, i) => `[${i + 1}] ${c.content}`)
+          .join("\n\n");
+
+        const response = await jobSearchChain.invoke({
+          history,
+          question,
+          jobResults,
+          resumeContext: resumeContext || "No resume data available",
+        });
+
+        const answer = extractAnswer(response);
+
+        if (answer && answer.length > 10) {
+          await saveMessage(
+            finalConversationId,
+            "assistant",
+            answer,
+            "job",
+            jobChunks
+          );
+
+          return {
+            conversationId: finalConversationId,
+            answer,
+            citedChunks: jobChunks,
+            source: "job",
+          };
+        }
+      }
+    }
+
+    // General query: Use RAG only (Serper temporarily disabled)
+    const ragResults = await queryRAG(question, {
+      topK: TOP_K * 2,
+      filter: {
+        userId,
+        resumeId,
+      },
+    });
+    const webChunks: CitedChunk[] = []; // searchWithSerper(question) disabled for now
 
     const ragRelevant = isContextRelevant(ragResults);
     const webRelevant = webChunks.length > 0;
@@ -415,7 +619,11 @@ export async function askQuestion(
 
       const answer = extractAnswer(response);
 
-      if (answer && answer.length > 10 && !answer.includes("don't have enough")) {
+      if (
+        answer &&
+        answer.length > 10 &&
+        !answer.includes("don't have enough")
+      ) {
         const citedChunks: CitedChunk[] = goodRagChunks.map((chunk) => ({
           id: chunk.id,
           score: chunk.score,
@@ -448,14 +656,15 @@ export async function askQuestion(
         .map((c, i) => `[${i + 1}] ${c.content}`)
         .join("\n\n");
 
-      const response = await webOnlyChain.invoke({
+      const response = await ragOnlyChain.invoke({
+        history,
         question,
         context: webContext,
       });
 
       const answer = extractAnswer(response);
 
-      if (answer && answer.length > 10 && !answer.includes("No job openings")) {
+      if (answer && answer.length > 10) {
         await saveMessage(
           finalConversationId,
           "assistant",

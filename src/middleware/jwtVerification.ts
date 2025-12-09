@@ -20,7 +20,6 @@ export const verifyAccessToken = (
       userId: string;
     };
 
-    console.log("Decoded JWT:", decoded);
     req.userId = decoded.userId;
     
     if (!req.userId) {

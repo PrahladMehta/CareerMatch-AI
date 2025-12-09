@@ -78,12 +78,12 @@ export const loginUser = async (req: Request, res: Response) => {
     });
 
     if (!user) {
-      return res.status(401).json({ error: "Invalid credentials" });
+      return res.status(400).json({ error: "Invalid credentials" });
     }
 
     const isPasswordValid = bcrypt.compareSync(password, user.password);
     if (!isPasswordValid) {
-      return res.status(401).json({ error: "Invalid credentials" });
+      return res.status(400).json({ error: "Invalid credentials" });
     }
 
     const accessToken = generateAccessToken(user.id);
