@@ -8,7 +8,7 @@ import {v4 as uuid} from "uuid"
 interface UpsertMetadata {
   chunkIndex: number;
   chunkContent: string;
-  documentId: string;
+  fileName: string;
   createdAt: string;
   userId: string;
   resumeId: string;
@@ -46,7 +46,7 @@ async function upsertVector(
     const cleanMetadata = {
       chunkIndex: metadata.chunkIndex,
       chunkContent: metadata.chunkContent,
-      documentId: metadata.documentId || "unknown",
+      documentId: metadata.fileName || "unknown",
       createdAt: metadata.createdAt || new Date().toISOString(),
       userId: metadata.userId,
       resumeId: metadata.resumeId

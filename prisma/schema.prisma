@@ -36,7 +36,7 @@ model Resume {
   id         String       @id @default(uuid())
   userId     String
   user       User         @relation(fields: [userId], references: [id])
-  name      string?       
+  name      String?       
 
   rawText    String?      
   summary    String?

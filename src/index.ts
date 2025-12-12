@@ -5,6 +5,7 @@ import createEmbaddingRoute from "./routes/CreateEmbedding";
 import askRoute from "./routes/ask";
 import userRoute from "./routes/user";
 import conversationRoute from "./routes/conversation";
+import resumeRoute from "./routes/resume";
 
 dotenv.config();
 const app = express();
@@ -22,12 +23,14 @@ app.use(
   createEmbaddingRoute,
   askRoute,
   userRoute,
-  conversationRoute
+  conversationRoute,
+  resumeRoute
 );
 // app.use("/api/v1",)
-
+  
 const port = process.env.PORT || 5080;
 
 app.listen(port, () => {
   console.log("Server run at port :", port);
 });
+      

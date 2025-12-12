@@ -19,7 +19,7 @@ interface ChunkEmbedding {
 interface Metadata {
   chunkIndex: number;
   chunkContent: string;
-  documentId: string;
+  fileName: string;
   createdAt: string;
   userId: string;
   resumeId: string;
@@ -132,17 +132,18 @@ export async function createChunkedEmbeddings(
 
 export async function uploadChunksToPinecone(
   text: string,
-  documentId: string,
+  fileName: string,
   userId: string
 ): Promise<void> {
   try {
-    console.log(`Starting chunk creation and upload for document: ${documentId}`);
+    console.log(`Starting chunk creation and upload for document: ${fileName}`);
 
     // Create resume record
     const resume = await prisma.resume.create({
       data: {
         userId: userId,
         rawText: text,
+        name: fileName,
       },
     });
 
@@ -163,7 +164,7 @@ export async function uploadChunksToPinecone(
       const metadata: Metadata = {
         chunkIndex: item.index,
         chunkContent: item.chunk,
-        documentId,
+        fileName: fileName,
         createdAt: new Date().toISOString(),
         userId: userId,
         resumeId: resume.id,

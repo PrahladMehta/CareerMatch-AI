@@ -29,7 +29,7 @@ const pdfToEmbed = async (req: Request, res: Response) => {
 
     const data = await PdfParse(pdfBuffer); // It's a function now, not a class!
 
-    await uploadChunksToPinecone(data.text,"doc_123",userId);
+    await uploadChunksToPinecone(data.text,req.file.originalname,userId);
 
     return res.json({
       text: data.text,
