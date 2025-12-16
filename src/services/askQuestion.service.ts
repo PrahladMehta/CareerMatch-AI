@@ -319,6 +319,70 @@ function isContextRelevant(chunks: any[]): boolean {
 }
 
 /**
+ * Generate a meaningful conversation title from the question
+ */
+function generateConversationTitle(question: string, source?: string): string {
+  // Clean and truncate the question
+  let title = question.trim();
+
+  // Remove question marks and extra whitespace
+  title = title.replace(/\?+$/, "").trim();
+
+  // Add prefix based on source/type
+  if (isJobSearchQuery(question)) {
+    title = `Job Search: ${title}`;
+  } else if (
+    title.toLowerCase().includes("resume") ||
+    title.toLowerCase().includes("experience")
+  ) {
+    title = `Resume Q: ${title}`;
+  }
+
+  // Truncate to 60 characters, preserving word boundaries
+  if (title.length > 60) {
+    title = title.substring(0, 57).trim();
+    const lastSpace = title.lastIndexOf(" ");
+    if (lastSpace > 40) {
+      title = title.substring(0, lastSpace);
+    }
+    title += "...";
+  }
+
+  return title || "New Conversation";
+}
+
+/**
+ * Update conversation title if it's still the default
+ */
+async function updateConversationTitleIfNeeded(
+  conversationId: string,
+  question: string,
+  source?: string
+): Promise<void> {
+  try {
+    const conversation = await prisma.conversation.findUnique({
+      where: { id: conversationId },
+    });
+
+    if (!conversation) return;
+
+    // Only update if it's still the default title format
+    const isDefaultTitle = conversation.title?.startsWith("Chat - ");
+
+    if (isDefaultTitle) {
+      const newTitle = generateConversationTitle(question, source);
+      await prisma.conversation.update({
+        where: { id: conversationId },
+        data: { title: newTitle },
+      });
+    }
+  } catch (error: any) {
+    console.error("Failed to update conversation title:", error.message);
+    // Don't throw - title update is not critical
+  }
+}
+
+/**
  * Create or get conversation
  */
 async function getOrCreateConversation(
@@ -522,6 +586,12 @@ export async function askQuestion(
             jobChunks
           );
 
+          await updateConversationTitleIfNeeded(
+            finalConversationId,
+            question,
+            "job"
+          );
+
           return {
             conversationId: finalConversationId,
             answer,
@@ -592,6 +662,12 @@ export async function askQuestion(
           citedChunks
         );
 
+        await updateConversationTitleIfNeeded(
+          finalConversationId,
+          question,
+          "combined"
+        );
+
         return {
           conversationId: finalConversationId,
           answer,
@@ -641,6 +717,12 @@ export async function askQuestion(
           citedChunks
         );
 
+        await updateConversationTitleIfNeeded(
+          finalConversationId,
+          question,
+          "rag"
+        );
+
         return {
           conversationId: finalConversationId,
           answer,
@@ -673,6 +755,12 @@ export async function askQuestion(
           webChunks
         );
 
+        await updateConversationTitleIfNeeded(
+          finalConversationId,
+          question,
+          "web"
+        );
+
         return {
           conversationId: finalConversationId,
           answer,
@@ -692,6 +780,12 @@ export async function askQuestion(
       errorAnswer,
       "error",
       []
+    );
+
+    await updateConversationTitleIfNeeded(
+      finalConversationId,
+      question,
+      "error"
     );
 
     return {
