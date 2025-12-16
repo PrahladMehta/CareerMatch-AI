@@ -10,7 +10,7 @@ import prisma from "../utils/prisma";
  */
 export async function askController(req: Request, res: Response): Promise<void> {
   try {
-    const { question, documentId,conversationId,resumeId} = req.body;
+    const { question,conversationId,resumeId} = req.body;
     const userId = (req as Request & { userId?: string }).userId;
     console.log("askController invoked",);
 
@@ -35,16 +35,9 @@ export async function askController(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    if (documentId && typeof documentId !== "string") {
-      res.status(400).json({
-        error: "'documentId' must be a string if provided.",
-      });
-      return;
-    }
+
 
     const cleanQuestion = question.trim();
-
-    console.log(`[ASK] Question: "${cleanQuestion}"${documentId ? ` | Doc: ${documentId}` : ""}`);
 
     // Call your RAG pipeline (all settings are fixed & safe inside askQuestion)
     const answer = await askQuestion(cleanQuestion, userId,conversationId,resumeId);
