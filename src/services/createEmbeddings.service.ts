@@ -33,31 +33,111 @@ const embeddings = new OpenAIEmbeddings({
 });
 
 /**
- * Detect resume section from text
- * Returns the section name (skills, experience, education, etc.)
+ * Section boundary definition for detection in full text
  */
-function detectSection(text: string): string {
-  const lowerText = text.toLowerCase();
+interface SectionBoundary {
+  pattern: RegExp;
+  section: string;
+}
 
-  // Define section patterns
-  const sectionPatterns = [
-    { pattern: /skill|proficiency|technical|competency/i, section: "skills" },
-    { pattern: /experience|employment|work history|professional/i, section: "experience" },
-    { pattern: /education|degree|university|college|certification/i, section: "education" },
-    { pattern: /project|portfolio|achievement|accomplishment/i, section: "projects" },
-    { pattern: /summary|objective|profile|about/i, section: "summary" },
-    { pattern: /contact|phone|email|address|linkedin/i, section: "contact" },
-    { pattern: /language|fluent|native|proficient/i, section: "languages" },
-    { pattern: /award|honor|recognition|certificate/i, section: "awards" },
+/**
+ * Detected section with its text content
+ */
+interface DetectedSection {
+  section: string;
+  text: string;
+}
+
+/**
+ * Detect and split text into sections based on section headers
+ * Section detection happens BEFORE chunking
+ */
+function detectAndSplitSections(text: string): DetectedSection[] {
+  const sectionBoundaries: SectionBoundary[] = [
+    {
+      pattern: /^(skills?|technical\s+skills?|core\s+competencies?)/i,
+      section: "skills",
+    },
+    {
+      pattern:
+        /^(experience|work\s+history|employment\s+history|professional\s+experience)/i,
+      section: "experience",
+    },
+    {
+      pattern:
+        /^(education|academic\s+background|degrees?|university|college)/i,
+      section: "education",
+    },
+    {
+      pattern: /^(projects?|portfolio|key\s+projects?|notable\s+projects?)/i,
+      section: "projects",
+    },
+    {
+      pattern:
+        /^(summary|objective|profile|about\s+me|professional\s+summary)/i,
+      section: "summary",
+    },
+    {
+      pattern: /^(contact|contact\s+information|reach\s+out)/i,
+      section: "contact",
+    },
+    { pattern: /^(languages?|language\s+proficiency)/i, section: "languages" },
+    {
+      pattern:
+        /^(awards?|honors?|recognitions?|certifications?|certificates?)/i,
+      section: "awards",
+    },
   ];
 
-  for (const { pattern, section } of sectionPatterns) {
-    if (pattern.test(lowerText)) {
-      return section;
+  const lines = text.split(/\n+/);
+  const sections: DetectedSection[] = [];
+  let currentSection = "other";
+  let currentText: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+
+    // Check if this line is a section header
+    let isSectionHeader = false;
+    for (const { pattern, section } of sectionBoundaries) {
+      if (pattern.test(line) && line.length < 100) {
+        // Save previous section if it has content
+        if (currentText.length > 0) {
+          sections.push({
+            section: currentSection,
+            text: currentText.join("\n").trim(),
+          });
+        }
+        // Start new section
+        currentSection = section;
+        currentText = [];
+        isSectionHeader = true;
+        break;
+      }
+    }
+
+    if (!isSectionHeader) {
+      currentText.push(lines[i]);
     }
   }
 
-  return "other"; // default section
+  // Add the last section
+  if (currentText.length > 0) {
+    sections.push({
+      section: currentSection,
+      text: currentText.join("\n").trim(),
+    });
+  }
+
+  // If no sections were detected, treat entire text as "other"
+  if (sections.length === 0) {
+    sections.push({
+      section: "other",
+      text: text.trim(),
+    });
+  }
+
+  return sections.filter((s) => s.text.length > 0);
 }
 
 /**
@@ -85,44 +165,82 @@ export async function createChunkedEmbeddings(
       throw new Error("Text cannot be empty");
     }
 
-    // Use LlamaIndex SentenceSplitter
-    console.log("Using LlamaIndex SentenceSplitter...");
-    const chunks = splitTextWithLlamaIndex(text);
-
-    // Filter out empty or very small chunks
-    const filteredChunks = chunks.filter((c) => c.trim().length > 50);
-
-    console.log(`✓ Created ${filteredChunks.length} chunks`);
+    // Step 1: Detect sections BEFORE chunking
+    console.log("Detecting sections in document...");
+    const detectedSections = detectAndSplitSections(text);
     console.log(
-      `Chunk sizes: min=${Math.min(...filteredChunks.map((c) => c.length))}, max=${Math.max(...filteredChunks.map((c) => c.length))}`
+      `✓ Detected ${detectedSections.length} sections: ${detectedSections
+        .map((s) => s.section)
+        .join(", ")}`
     );
 
+    console.log("detectedSections", detectedSections);
+    
+    // Step 2: Chunk each section separately
+    console.log(
+      "Using LlamaIndex SentenceSplitter for section-wise chunking..."
+    );
     const chunksWithEmbeddings: ChunkEmbedding[] = [];
+    let globalChunkIndex = 0;
 
-    // Embed chunks with batch processing to avoid rate limits
-    for (let i = 0; i < filteredChunks.length; i++) {
-      try {
-        const embedding = await embeddings.embedQuery(filteredChunks[i]);
-        const section = detectSection(filteredChunks[i]);
+    for (const detectedSection of detectedSections) {
+      if (!detectedSection.text.trim()) {
+        continue;
+      }
 
-        chunksWithEmbeddings.push({
-          chunk: filteredChunks[i],
-          embedding,
-          index: i,
-          section,
-        });
+      // Chunk this section
+      const sectionChunks = splitTextWithLlamaIndex(detectedSection.text);
 
-        // Log progress every 5 chunks
-        if ((i + 1) % 5 === 0) {
-          console.log(`  Embedded ${i + 1}/${filteredChunks.length} chunks...`);
+      // Filter out empty or very small chunks
+      const filteredSectionChunks = sectionChunks.filter(
+        (c) => c.trim().length > 50
+      );
+
+      console.log(
+        `  Section "${detectedSection.section}": ${filteredSectionChunks.length} chunks`
+      );
+
+      // Embed chunks for this section
+      for (let i = 0; i < filteredSectionChunks.length; i++) {
+        try {
+          const embedding = await embeddings.embedQuery(
+            filteredSectionChunks[i]
+          );
+
+          chunksWithEmbeddings.push({
+            chunk: filteredSectionChunks[i],
+            embedding,
+            index: globalChunkIndex,
+            section: detectedSection.section,
+          });
+
+          globalChunkIndex++;
+
+          // Log progress every 5 chunks
+          if (chunksWithEmbeddings.length % 5 === 0) {
+            console.log(`  Embedded ${chunksWithEmbeddings.length} chunks...`);
+          }
+        } catch (err: any) {
+          console.error(
+            `Failed to embed chunk ${globalChunkIndex}:`,
+            err.message
+          );
+          // Continue with next chunk instead of failing completely
         }
-      } catch (err: any) {
-        console.error(`Failed to embed chunk ${i}:`, err.message);
-        // Continue with next chunk instead of failing completely
       }
     }
 
-    console.log(`✓ Successfully embedded ${chunksWithEmbeddings.length} chunks`);
+    console.log(`✓ Created ${chunksWithEmbeddings.length} total chunks`);
+    if (chunksWithEmbeddings.length > 0) {
+      console.log(
+        `Chunk sizes: min=${Math.min(
+          ...chunksWithEmbeddings.map((c) => c.chunk.length)
+        )}, max=${Math.max(...chunksWithEmbeddings.map((c) => c.chunk.length))}`
+      );
+    }
+    console.log(
+      `✓ Successfully embedded ${chunksWithEmbeddings.length} chunks`
+    );
     return chunksWithEmbeddings;
   } catch (error: any) {
     console.error("Embedding error:", error);
@@ -191,12 +309,16 @@ export async function uploadChunksToPinecone(
         // Log every 10 uploads
         if ((item.index + 1) % 10 === 0) {
           console.log(
-            `  Uploaded ${item.index + 1}/${chunksWithEmbeddings.length} chunks to Pinecone and DB...`
+            `  Uploaded ${item.index + 1}/${
+              chunksWithEmbeddings.length
+            } chunks to Pinecone and DB...`
           );
         }
       } catch (err: any) {
         console.error(`Failed to process chunk ${item.index}:`, err.message);
-        throw new Error(`Failed to process chunk ${item.index}: ${err.message}`);
+        throw new Error(
+          `Failed to process chunk ${item.index}: ${err.message}`
+        );
       }
     }
 
@@ -215,10 +337,10 @@ export async function uploadChunksToPinecone(
  */
 export async function getChunkById(
   pineconeId: string
-): Promise<{ text: string; section: string|null; resumeId: string } | null> {
+): Promise<{ text: string; section: string | null; resumeId: string } | null> {
   try {
     const chunk = await prisma.resumeChunk.findFirst({
-      where: { pineconeId:pineconeId },
+      where: { pineconeId: pineconeId },
       select: {
         text: true,
         section: true,
