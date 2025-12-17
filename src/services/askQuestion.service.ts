@@ -158,26 +158,125 @@ interface QuestionResponse {
 }
 
 /**
- * Detect if query is job-related
+ * Query analysis result from LLM
  */
-function isJobSearchQuery(question: string): boolean {
-  const jobKeywords = [
-    "job",
-    "position",
-    "role",
-    "hiring",
-    "opportunity",
-    "career",
-    "work",
-    "employment",
-    "apply",
-    "looking for",
-    "recruit",
-    "vacancy",
-    "opening",
-  ];
-  const lowerQuestion = question.toLowerCase();
-  return jobKeywords.some((keyword) => lowerQuestion.includes(keyword));
+interface QueryAnalysis {
+  intent: "resume_query" | "career_guidance" | "job_search" | "irrelevant";
+  confidence: number;
+  rewrittenQuery: string;
+  jobSearch?: {
+    jobTitle?: string;
+    location?: string;
+    skills?: string[];
+  };
+  reasoning?: string;
+}
+
+/**
+ * Analyze query using LLM to determine intent, confidence, and extract parameters
+ * Makes a single LLM call that returns structured JSON
+ */
+async function analyzeQuery(question: string): Promise<QueryAnalysis> {
+  const analysisPrompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      `You are a query analysis system for a career/resume RAG application.
+Your task is to analyze user queries and classify their intent.
+
+INTENTS:
+- resume_query: Questions about the user's own resume, experience, skills, education
+- career_guidance: Career advice, professional development, industry insights
+- job_search: User wants to find job opportunities, positions, roles
+- irrelevant: Not related to career, resume, or job search
+
+RULES:
+1. Return ONLY valid JSON, no additional text
+2. confidence must be between 0.0 and 1.0
+3. rewrittenQuery should optimize the query for retrieval (remove filler words, clarify intent)
+4. jobSearch object should ONLY be populated if intent === "job_search"
+5. skills array should ONLY contain technical/professional skills mentioned in the query
+6. If intent is "irrelevant" or confidence < 0.6, set confidence to 0.0
+
+OUTPUT FORMAT (strict JSON):
+{{
+  "intent": "resume_query" | "career_guidance" | "job_search" | "irrelevant",
+  "confidence": 0.0-1.0,
+  "rewrittenQuery": "optimized query string",
+  "jobSearch": {{
+    "jobTitle": "optional job title",
+    "location": "optional location",
+    "skills": ["skill1", "skill2"]
+  }},
+  "reasoning": "brief explanation"
+}}`,
+    ],
+    ["human", "Analyze this query: {question}"],
+  ]);
+
+  try {
+    const analysisChain = analysisPrompt.pipe(llm);
+    const response = await analysisChain.invoke({ question });
+
+    let analysisText = extractAnswer(response);
+
+    // Clean JSON response (remove markdown code blocks if present)
+    analysisText = analysisText.trim();
+    if (analysisText.startsWith("```json")) {
+      analysisText = analysisText
+        .replace(/```json\n?/g, "")
+        .replace(/```\n?/g, "");
+    } else if (analysisText.startsWith("```")) {
+      analysisText = analysisText.replace(/```\n?/g, "");
+    }
+
+    const analysis: QueryAnalysis = JSON.parse(analysisText);
+
+    // Validate and normalize
+    if (
+      !["resume_query", "career_guidance", "job_search", "irrelevant"].includes(
+        analysis.intent
+      )
+    ) {
+      analysis.intent = "irrelevant";
+      analysis.confidence = 0.0;
+    }
+
+    if (analysis.confidence < 0 || analysis.confidence > 1) {
+      analysis.confidence = analysis.intent === "irrelevant" ? 0.0 : 0.8;
+    }
+
+    if (
+      !analysis.rewrittenQuery ||
+      analysis.rewrittenQuery.trim().length === 0
+    ) {
+      analysis.rewrittenQuery = question;
+    }
+
+    // Clear jobSearch if intent is not job_search
+    if (analysis.intent !== "job_search") {
+      analysis.jobSearch = undefined;
+    }
+
+    // Ensure skills array exists for job_search
+    if (analysis.intent === "job_search" && !analysis.jobSearch) {
+      analysis.jobSearch = { skills: [] };
+    } else if (
+      analysis.intent === "job_search" &&
+      !analysis.jobSearch?.skills
+    ) {
+      analysis.jobSearch = { ...analysis.jobSearch, skills: [] };
+    }
+
+    return analysis;
+  } catch (error: any) {
+    console.error("Query analysis error:", error.message);
+    // Fallback to safe defaults
+    return {
+      intent: "irrelevant",
+      confidence: 0.0,
+      rewrittenQuery: question,
+    };
+  }
 }
 
 /**
@@ -328,10 +427,8 @@ function generateConversationTitle(question: string, source?: string): string {
   // Remove question marks and extra whitespace
   title = title.replace(/\?+$/, "").trim();
 
-  // Add prefix based on source/type
-  if (isJobSearchQuery(question)) {
-    title = `Job Search: ${title}`;
-  } else if (
+  // Add prefix based on source/type (will be updated by analyzeQuery in actual flow)
+  if (
     title.toLowerCase().includes("resume") ||
     title.toLowerCase().includes("experience")
   ) {
@@ -542,16 +639,56 @@ export async function askQuestion(
     let history = await getConversationHistory(finalConversationId);
     history = filterHistoryByTokens(history);
 
-    // Detect if job search query
-    const isJobQuery = isJobSearchQuery(question);
+    // Step 1: Analyze query with single LLM call
+    const analysis = await analyzeQuery(question);
+    console.log(analysis);
+    console.log(
+      `Query analysis: intent=${analysis.intent}, confidence=${analysis.confidence}`
+    );
 
-    if (isJobQuery) {
-      // Search jobs using JSearch API
-      const jobChunks = await searchWithJSearch(question);
+    // Step 2: Apply guardrails - early exit for irrelevant or low confidence
+    if (analysis.intent === "irrelevant" || analysis.confidence < 0.6) {
+      const guardrailMessage =
+        "I can only help with questions related to your resume, career guidance, or job search. Please ask a relevant question.";
+
+      await saveMessage(
+        finalConversationId,
+        "assistant",
+        guardrailMessage,
+        "error",
+        []
+      );
+
+      await updateConversationTitleIfNeeded(
+        finalConversationId,
+        question,
+        "error"
+      );
+
+      return {
+        conversationId: finalConversationId,
+        answer: guardrailMessage,
+        citedChunks: [],
+        source: "error",
+      };
+    }
+
+    // Step 3: Use rewritten query for downstream calls
+    const queryToUse = analysis.rewrittenQuery || question;
+
+    // Step 4: Route based on intent
+    if (analysis.intent === "job_search") {
+      // Search jobs using JSearch API with rewritten query
+      const jobChunks = await searchWithJSearch(queryToUse);
 
       if (jobChunks.length > 0) {
-        // Also get RAG context for resume skills matching
-        const ragResults = await queryRAG(question, {
+        // Get RAG context for resume skills matching (use skills from analysis if available)
+        const skillsToQuery =
+          analysis.jobSearch?.skills && analysis.jobSearch.skills.length > 0
+            ? analysis.jobSearch.skills.join(" ")
+            : queryToUse;
+
+        const ragResults = await queryRAG(skillsToQuery, {
           topK: 5,
           filter: {
             userId,
@@ -570,7 +707,7 @@ export async function askQuestion(
 
         const response = await jobSearchChain.invoke({
           history,
-          question,
+          question: queryToUse,
           jobResults,
           resumeContext: resumeContext || "No resume data available",
         });
@@ -602,15 +739,15 @@ export async function askQuestion(
       }
     }
 
-    // General query: Use RAG only (Serper temporarily disabled)
-    const ragResults = await queryRAG(question, {
+    // Step 5: Route resume_query and career_guidance to RAG pipeline
+    // Use rewritten query for better retrieval
+    const ragResults = await queryRAG(queryToUse, {
       topK: TOP_K * 2,
       filter: {
-        userId,
-        resumeId,
+        userId
       },
     });
-    const webChunks: CitedChunk[] = []; // searchWithSerper(question) disabled for now
+    const webChunks: CitedChunk[] = []; // searchWithSerper(queryToUse) disabled for now
 
     const ragRelevant = isContextRelevant(ragResults);
     const webRelevant = webChunks.length > 0;
@@ -631,7 +768,7 @@ export async function askQuestion(
 
       const response = await combinedChain.invoke({
         history,
-        question,
+        question: queryToUse,
         ragContext,
         webContext,
       });
@@ -689,7 +826,7 @@ export async function askQuestion(
 
       const response = await ragOnlyChain.invoke({
         history,
-        question,
+        question: queryToUse,
         context,
       });
 
