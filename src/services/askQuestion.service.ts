@@ -9,6 +9,7 @@ import {
 import axios from "axios";
 import prisma from "../utils/prisma.js";
 import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
+import { cache } from "./caching.js";
 
 const TOP_K = 10;
 const MIN_SCORE = 0.1;
@@ -636,9 +637,6 @@ export async function askQuestion(
 
     await saveMessage(finalConversationId, "user", question, "user", []);
 
-    let history = await getConversationHistory(finalConversationId);
-    history = filterHistoryByTokens(history);
-
     // Step 1: Analyze query with single LLM call
     const analysis = await analyzeQuery(question);
     console.log(analysis);
@@ -672,6 +670,39 @@ export async function askQuestion(
         source: "error",
       };
     }
+
+    // Step 2.5: Check semantic cache for similar queries
+    const cachedResponse = await cache.getCachedResponse(question, userId);
+    if (cachedResponse) {
+      // Use cached conversation ID if available, otherwise use current one
+      const responseConversationId =
+        cachedResponse.conversationId || finalConversationId;
+
+      // Save cached response as a new message in the conversation
+      await saveMessage(
+        finalConversationId,
+        "assistant",
+        cachedResponse.answer,
+        cachedResponse.source,
+        cachedResponse.citedChunks
+      );
+
+      const cachedReturn: QuestionResponse = {
+        conversationId: responseConversationId,
+        answer: cachedResponse.answer,
+        citedChunks: cachedResponse.citedChunks,
+        source: cachedResponse.source as
+          | "rag"
+          | "web"
+          | "job"
+          | "combined"
+          | "error",
+      };
+
+      return cachedReturn;
+    }
+    let history = await getConversationHistory(finalConversationId);
+    history = filterHistoryByTokens(history);
 
     // Step 3: Use rewritten query for downstream calls
     const queryToUse = analysis.rewrittenQuery || question;
@@ -729,12 +760,17 @@ export async function askQuestion(
             "job"
           );
 
-          return {
+          const response: QuestionResponse = {
             conversationId: finalConversationId,
             answer,
             citedChunks: jobChunks,
             source: "job",
           };
+
+          // Store in semantic cache
+          cache.storeQueryResponse(question, response, userId);
+
+          return response;
         }
       }
     }
@@ -744,7 +780,7 @@ export async function askQuestion(
     const ragResults = await queryRAG(queryToUse, {
       topK: TOP_K * 2,
       filter: {
-        userId
+        userId,
       },
     });
     const webChunks: CitedChunk[] = []; // searchWithSerper(queryToUse) disabled for now
@@ -805,12 +841,17 @@ export async function askQuestion(
           "combined"
         );
 
-        return {
+        const response: QuestionResponse = {
           conversationId: finalConversationId,
           answer,
           citedChunks,
           source: "combined",
         };
+
+        // Store in semantic cache (only for newly generated responses, not cache hits)
+        await cache.storeQueryResponse(question, response, userId);
+
+        return response;
       }
     }
 
@@ -860,12 +901,17 @@ export async function askQuestion(
           "rag"
         );
 
-        return {
+        const response: QuestionResponse = {
           conversationId: finalConversationId,
           answer,
           citedChunks,
           source: "rag",
         };
+
+        // Store in semantic cache
+        await cache.storeQueryResponse(question, response, userId);
+
+        return response;
       }
     }
 
@@ -898,12 +944,17 @@ export async function askQuestion(
           "web"
         );
 
-        return {
+        const response: QuestionResponse = {
           conversationId: finalConversationId,
           answer,
           citedChunks: webChunks,
           source: "web",
         };
+
+        // Store in semantic cache (only for newly generated responses, not cache hits)
+        await cache.storeQueryResponse(question, response, userId);
+
+        return response;
       }
     }
 

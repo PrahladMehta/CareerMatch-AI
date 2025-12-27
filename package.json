@@ -26,6 +26,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.0.0",
     "@types/pdf-parse": "^1.1.5",
+    "@upstash/redis": "^1.35.8",
     "axios": "^1.13.2",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
